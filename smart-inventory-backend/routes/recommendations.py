@@ -1,52 +1,80 @@
-import os
+from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from database.db import get_db
-from database.models import InventoryRecord, Product, Supplier
+from database.models import (
+    AuditLog,
+    InventoryRecord,
+    Order,
+    Product,
+    RecommendationDecision,
+    Supplier,
+)
+from services.model_manager import ModelManager
 from services.rl_environment import SupplyChainEnv
-from training.cql_model import CQLAgent
-
-from datetime import datetime
-from routes.activity import add_activity_log
+from utils.security import get_current_tenant, require_permission
 
 router = APIRouter(prefix="/api/recommendations", tags=["recommendations"])
 
-# Load trained CQL model globally if available
-CQL_MODEL_PATH = os.path.join("training", "saved_models", "cql_supply_chain.pt")
-cql_agent: Optional[CQLAgent] = None
-
-if os.path.exists(CQL_MODEL_PATH):
-    try:
-        cql_agent = CQLAgent(state_dim=9, action_dim=3, hidden_dim=128)
-        cql_agent.load_model(CQL_MODEL_PATH)
-    except Exception as e:
-        print(f"Warning: Failed to load CQL model: {e}")
-
-# In-memory store for user approval decision overrides
-DECISION_STATE_STORE = {}
-
 
 class DecisionRequest(BaseModel):
-    decision: str  # APPROVED | MODIFIED | REJECTED
+    decision: str = Field(..., description="APPROVED | MODIFIED | REJECTED")
     decisionNotes: Optional[str] = None
     modifiedQuantity: Optional[int] = None
 
 
 @router.get("")
-def get_ai_recommendations(db: Session = Depends(get_db)):
-    """Generate real RL (PPO/CQL) AI replenishment recommendations for all inventory records."""
-    inventory_records = db.query(InventoryRecord).all()
-    products = {p.id: p for p in db.query(Product).all()}
-    suppliers = {s.id: s for s in db.query(Supplier).all()}
+def get_ai_recommendations(
+    db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("recommendations.read")),
+):
+    """Generate real RL (PPO/CQL) AI replenishment recommendations for inventory records belonging to active organization."""
+    current_user, current_org = auth_data
+    cql_agent = ModelManager.get_cql_agent()
+
+    inventory_records = (
+        db.query(InventoryRecord)
+        .filter(InventoryRecord.organization_id == current_org.id)
+        .all()
+    )
+    products = {
+        p.id: p
+        for p in db.query(Product).filter(Product.organization_id == current_org.id).all()
+    }
+    suppliers = {
+        s.id: s
+        for s in db.query(Supplier).filter(Supplier.organization_id == current_org.id).all()
+    }
+    orders = db.query(Order).filter(Order.organization_id == current_org.id).all()
+
+    # Pre-fetch saved human recommendation decisions for this organization from DB
+    saved_decisions = {
+        rd.recommendation_id: rd
+        for rd in db.query(RecommendationDecision)
+        .filter(RecommendationDecision.organization_id == current_org.id)
+        .all()
+    }
+
+    # Pre-map supplier per product from existing purchase orders
+    product_supplier_map = {}
+    for o in orders:
+        if o.product_id not in product_supplier_map and o.supplier_id in suppliers:
+            product_supplier_map[o.product_id] = suppliers[o.supplier_id]
+
+    default_supplier = list(suppliers.values())[0] if suppliers else None
 
     recommendations = []
 
     for rec in inventory_records:
         prod = products.get(rec.product_id)
-        sup = suppliers.get(rec.product_id) or suppliers.get(1)
+        sup = (
+            product_supplier_map.get(rec.product_id)
+            or suppliers.get(rec.product_id)
+            or default_supplier
+        )
 
         prod_name = prod.name if prod else f"Product {rec.product_id}"
         sku = prod.sku if prod else f"SKU-{rec.product_id}"
@@ -54,8 +82,22 @@ def get_ai_recommendations(db: Session = Depends(get_db)):
         supplier_id = str(sup.id) if sup else "1"
         lead_time = sup.lead_time_days if sup else 4
 
-        # Create isolated env to compute exact state
-        env = SupplyChainEnv(db=db, product_id=rec.product_id, initial_inventory=rec.quantity, max_steps=1, fixed_order_quantity=50)
+        # Create isolated env with preloaded tenant entities
+        preloaded = {
+            "product": prod,
+            "supplier": sup,
+            "safety_stock": rec.safety_stock,
+            "reorder_point": rec.reorder_point,
+        }
+        env = SupplyChainEnv(
+            db=db,
+            product_id=rec.product_id,
+            initial_inventory=rec.quantity,
+            max_steps=1,
+            fixed_order_quantity=50,
+            preloaded_entities=preloaded,
+            organization_id=str(current_org.id),
+        )
         obs, _ = env.reset(seed=42)
 
         # Select action via trained CQL agent if available, else default rule
@@ -68,7 +110,14 @@ def get_ai_recommendations(db: Session = Depends(get_db)):
                 action_code = 0
 
         rec_id = f"rec-00{rec.id}"
-        decision_info = DECISION_STATE_STORE.get(rec_id, {})
+        db_decision = saved_decisions.get(rec_id)
+
+        decision_state = db_decision.decision if db_decision else "PENDING"
+        decision_date = (
+            db_decision.decision_date.isoformat() if db_decision and db_decision.decision_date else None
+        )
+        decision_notes = db_decision.decision_notes if db_decision else None
+        modified_qty = db_decision.modified_quantity if db_decision else None
 
         if action_code == 1:
             action_type = "ORDER"
@@ -120,7 +169,7 @@ def get_ai_recommendations(db: Session = Depends(get_db)):
                 "sku": sku,
                 "location": getattr(rec, "location", "Hyderabad DC"),
                 "action": action_type,
-                "quantity": decision_info.get("modifiedQuantity", qty),
+                "quantity": modified_qty if modified_qty is not None else qty,
                 "supplier": supplier_name,
                 "supplierId": supplier_id,
                 "confidence": confidence,
@@ -136,9 +185,9 @@ def get_ai_recommendations(db: Session = Depends(get_db)):
                 "safetyStock": rec.safety_stock,
                 "reorderPoint": rec.reorder_point,
                 "currentDemand": 18,
-                "decisionState": decision_info.get("decision", "PENDING"),
-                "decisionDate": decision_info.get("decisionDate"),
-                "decisionNotes": decision_info.get("decisionNotes"),
+                "decisionState": decision_state,
+                "decisionDate": decision_date,
+                "decisionNotes": decision_notes,
                 "createdAt": "2026-09-03T08:30:00Z",
             }
         )
@@ -147,30 +196,60 @@ def get_ai_recommendations(db: Session = Depends(get_db)):
 
 
 @router.post("/{rec_id}/decision")
-def update_recommendation_decision(rec_id: str, request: DecisionRequest):
-    """Update decision state (APPROVED, MODIFIED, REJECTED) for an AI recommendation."""
-    decision_date = datetime.now().isoformat()
-    DECISION_STATE_STORE[rec_id] = {
-        "decision": request.decision,
-        "decisionNotes": request.decisionNotes,
-        "modifiedQuantity": request.modifiedQuantity,
-        "decisionDate": decision_date,
-    }
+def update_recommendation_decision(
+    rec_id: str,
+    request: DecisionRequest,
+    db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("recommendations.approve")),
+):
+    """Update decision state (APPROVED, MODIFIED, REJECTED) for an AI recommendation persistently in database."""
+    current_user, current_org = auth_data
+    now_dt = datetime.now(timezone.utc)
 
-    # Record operational audit activity log item
-    act_item = {
-        "id": f"act-dec-{rec_id}-{int(datetime.now().timestamp())}",
-        "type": "ORDER" if request.decision == "APPROVED" else "AI_RECOMMENDATION",
-        "actor": "Operations Lead",
-        "title": f"Recommendation {rec_id} {request.decision.capitalize()}",
-        "description": f"Human decision recorded ({request.decision}) for recommendation {rec_id}."
-        + (f" Notes: {request.decisionNotes}" if request.decisionNotes else ""),
-        "timestamp": "Just now",
-        "timeGroup": "TODAY",
-        "humanDecision": request.decision,
-        "recommendationId": rec_id,
-    }
-    add_activity_log(act_item)
+    # Upsert RecommendationDecision in DB for this organization
+    db_decision = (
+        db.query(RecommendationDecision)
+        .filter(
+            RecommendationDecision.organization_id == current_org.id,
+            RecommendationDecision.recommendation_id == rec_id,
+        )
+        .first()
+    )
+
+    if not db_decision:
+        db_decision = RecommendationDecision(
+            organization_id=current_org.id,
+            recommendation_id=rec_id,
+            user_id=current_user.id,
+            decision=request.decision,
+            decision_notes=request.decisionNotes,
+            modified_quantity=request.modifiedQuantity,
+            decision_date=now_dt,
+        )
+        db.add(db_decision)
+    else:
+        db_decision.user_id = current_user.id
+        db_decision.decision = request.decision
+        db_decision.decision_notes = request.decisionNotes
+        db_decision.modified_quantity = request.modifiedQuantity
+        db_decision.decision_date = now_dt
+
+    # Record persistent audit log in DB
+    audit_entry = AuditLog(
+        organization_id=current_org.id,
+        user_id=current_user.id,
+        action=f"RECOMMENDATION_{request.decision}",
+        resource_type="RECOMMENDATION",
+        resource_id=rec_id,
+        details={
+            "decision": request.decision,
+            "decision_notes": request.decisionNotes,
+            "modified_quantity": request.modifiedQuantity,
+        },
+        timestamp=now_dt,
+    )
+    db.add(audit_entry)
+    db.commit()
 
     return {
         "status": "success",

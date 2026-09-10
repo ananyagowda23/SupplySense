@@ -1,17 +1,37 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+
 from database.db import get_db
 from database.models import InventoryRecord, Product, Supplier
+from utils.security import require_permission
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
 
 @router.get("/summary")
-def get_analytics_summary(range: str = "30D", db: Session = Depends(get_db)):
-    """Compute executive analytics summary metrics from database inventory and product records."""
-    inventory_records = db.query(InventoryRecord).all()
-    products = db.query(Product).all()
-    suppliers = db.query(Supplier).all()
+def get_analytics_summary(
+    range: str = "30D",
+    db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("analytics.read")),
+):
+    """Compute executive analytics summary metrics for the active organization."""
+    _, current_org = auth_data
+
+    inventory_records = (
+        db.query(InventoryRecord)
+        .filter(InventoryRecord.organization_id == current_org.id)
+        .all()
+    )
+    products = (
+        db.query(Product)
+        .filter(Product.organization_id == current_org.id)
+        .all()
+    )
+    suppliers = (
+        db.query(Supplier)
+        .filter(Supplier.organization_id == current_org.id)
+        .all()
+    )
 
     product_map = {p.id: p for p in products}
 
@@ -25,7 +45,6 @@ def get_analytics_summary(range: str = "30D", db: Session = Depends(get_db)):
         unit_cost = prod.unit_price if prod else 100.0
         total_value += rec.quantity * unit_cost
 
-        # Health status logic
         if rec.quantity <= rec.safety_stock:
             critical_count += 1
         elif rec.quantity <= rec.reorder_point:

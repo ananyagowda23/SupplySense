@@ -11,6 +11,7 @@ import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { useRouter } from 'expo-router';
 import { Colors, Typography, Spacing, BorderRadius, Shadows } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
+import { useAuth } from '@/context/AuthContext';
 
 interface MenuItem {
   id: string;
@@ -26,6 +27,11 @@ export default function MoreScreen() {
   const router = useRouter();
   const colorScheme = useColorScheme() ?? 'light';
   const theme = Colors[colorScheme];
+  const { user, role, organization } = useAuth();
+
+  const initials = user?.full_name
+    ? user.full_name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase()
+    : 'US';
 
   const menuItems: MenuItem[] = [
     {
@@ -89,12 +95,12 @@ export default function MoreScreen() {
             Shadows.card,
           ]}>
           <View style={[styles.avatar, { backgroundColor: theme.primary }]}>
-            <Text style={styles.avatarText}>AN</Text>
+            <Text style={styles.avatarText}>{initials}</Text>
           </View>
           <View style={styles.userInfo}>
-            <Text style={[styles.userName, { color: theme.text }]}>Ananya Sharma</Text>
+            <Text style={[styles.userName, { color: theme.text }]}>{user?.full_name || 'Enterprise User'}</Text>
             <Text style={[styles.userRole, { color: theme.textMuted }]}>
-              Lead Operations Manager • SupplySense Org
+              {role || 'MANAGER'} • {organization?.name || 'SupplySense Org'}
             </Text>
           </View>
           <TouchableOpacity

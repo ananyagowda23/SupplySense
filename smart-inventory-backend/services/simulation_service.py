@@ -1,19 +1,25 @@
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from database.models import InventoryRecord, Order, Product, Supplier
-from schemas.simulation import SimulationRequest, SimulationResponse, DailySimulationResult
+from schemas.simulation import DailySimulationResult, SimulationRequest, SimulationResponse
 from services.forecasting_service import generate_forecast
 
 
-def run_simulation(db: Session, request: SimulationRequest) -> SimulationResponse:
+def run_simulation(
+    db: Session, request: SimulationRequest, organization_id: Optional[str] = None
+) -> SimulationResponse:
     """Run an isolated in-memory supply-chain simulation supporting sequential per-day actions.
     
-    Zero changes are written to the database.
+    Zero changes are written to the database. Scoped to active organization if organization_id provided.
     """
-    # 1. Validate Product existence
-    product = db.query(Product).filter(Product.id == request.product_id).first()
+    # 1. Validate Product existence within tenant
+    prod_query = db.query(Product).filter(Product.id == request.product_id)
+    if organization_id:
+        prod_query = prod_query.filter(Product.organization_id == str(organization_id))
+    product = prod_query.first()
+
     if not product:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -21,7 +27,11 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
         )
 
     # 2. Cache Supplier details for fast resolution
-    all_suppliers = db.query(Supplier).all()
+    sup_query = db.query(Supplier)
+    if organization_id:
+        sup_query = sup_query.filter(Supplier.organization_id == str(organization_id))
+    all_suppliers = sup_query.all()
+
     if not all_suppliers:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -34,26 +44,31 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
     if request.supplier_id and request.supplier_id in supplier_cache:
         default_supplier = supplier_cache[request.supplier_id]
     else:
-        linked_supplier = (
+        linked_query = (
             db.query(Supplier)
             .join(Order, Supplier.id == Order.supplier_id)
             .filter(Order.product_id == request.product_id)
-            .first()
         )
+        if organization_id:
+            linked_query = linked_query.filter(Supplier.organization_id == str(organization_id))
+        linked_supplier = linked_query.first()
         default_supplier = linked_supplier if linked_supplier else all_suppliers[0]
 
     # 3. Retrieve Inventory parameters (safety_stock, reorder_point)
-    inv_record = (
-        db.query(InventoryRecord)
-        .filter(InventoryRecord.product_id == request.product_id)
-        .first()
-    )
+    inv_query = db.query(InventoryRecord).filter(InventoryRecord.product_id == request.product_id)
+    if organization_id:
+        inv_query = inv_query.filter(InventoryRecord.organization_id == str(organization_id))
+    inv_record = inv_query.first()
+
     safety_stock = inv_record.safety_stock if inv_record else 10
     reorder_point = inv_record.reorder_point if inv_record else 20
 
     # 4. Generate/Retrieve Demand Forecast for the simulation horizon
     forecast_data = generate_forecast(
-        db=db, product_id=request.product_id, days=request.simulation_days
+        db=db,
+        product_id=request.product_id,
+        days=request.simulation_days,
+        organization_id=organization_id,
     )
     forecast_items = forecast_data["forecast"]
 
@@ -66,7 +81,7 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
 
     # 6. Initialize In-Memory Simulation State
     current_inventory = int(request.initial_inventory)
-    pending_orders: List[Dict[str, Any]] = []  # [{"quantity": int, "days_remaining": int, "supplier_id": int}]
+    pending_orders: List[Dict[str, Any]] = []
 
     daily_results: List[DailySimulationResult] = []
 
@@ -87,14 +102,12 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
         sim_date = forecast_item["date"]
         daily_demand = float(forecast_item["predicted_demand"])
 
-        # Determine action for today (t)
         if request.actions and t < len(request.actions):
             act_obj = request.actions[t]
             curr_action = act_obj.action
             curr_order_qty = act_obj.order_quantity
             curr_sup_id = act_obj.supplier_id or request.supplier_id
         elif request.action is not None:
-            # Single action mode: runs on Day 1 only unless repeat_policy=True
             if t == 0 or request.repeat_policy:
                 curr_action = request.action
                 curr_order_qty = request.order_quantity or 0
@@ -108,16 +121,13 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
             curr_order_qty = 0
             curr_sup_id = request.supplier_id
 
-        # Resolve supplier for today's action
         act_supplier = (
             supplier_cache.get(curr_sup_id, default_supplier)
             if curr_sup_id
             else default_supplier
         )
 
-        # -------------------------------------------------------------
-        # STEP 1: RECEIVE DELIVERIES (Morning)
-        # -------------------------------------------------------------
+        # Receive morning deliveries
         arrived_qty = 0
         remaining_pending = []
         for p_order in pending_orders:
@@ -128,13 +138,10 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
                 remaining_pending.append(p_order)
         pending_orders = remaining_pending
 
-        # Starting inventory after morning deliveries arrive
         current_inventory += arrived_qty
         starting_inventory = current_inventory
 
-        # -------------------------------------------------------------
-        # STEP 2: APPLY TODAY'S ACTION
-        # -------------------------------------------------------------
+        # Apply today's action
         action_taken = action_names.get(curr_action, "NOOP")
         purchase_cost = 0.0
         expedite_cost = 0.0
@@ -156,11 +163,9 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
         elif curr_action == 2:  # EXPEDITE
             expedite_cost = expedite_fixed_fee
             if pending_orders:
-                # Accelerate existing order by reducing days_remaining by 2 days (min 1 day)
                 target_order = pending_orders[0]
                 target_order["days_remaining"] = max(1, target_order["days_remaining"] - 2)
             else:
-                # Place new order with expedited lead time
                 if curr_order_qty > 0:
                     order_qty_placed = int(curr_order_qty)
                     expedited_lead_time = max(1, int(act_supplier.lead_time_days) - 2)
@@ -173,17 +178,12 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
                     )
                     purchase_cost = round(order_qty_placed * unit_purchase_cost, 2)
 
-        # -------------------------------------------------------------
-        # STEP 3: FULFILL DEMAND & UPDATE INVENTORY
-        # -------------------------------------------------------------
+        # Fulfill demand
         fulfilled_demand = min(float(starting_inventory), daily_demand)
         stockout_quantity = max(0.0, daily_demand - float(starting_inventory))
         ending_inventory = int(starting_inventory - fulfilled_demand)
         current_inventory = ending_inventory
 
-        # -------------------------------------------------------------
-        # STEP 4: CALCULATE COSTS, REVENUE & REWARD
-        # -------------------------------------------------------------
         revenue = round(fulfilled_demand * unit_selling_price, 2)
         holding_cost = round(ending_inventory * holding_cost_per_unit_day, 2)
         shortage_cost = round(stockout_quantity * shortage_cost_per_unit, 2)
@@ -192,11 +192,8 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
         )
 
         daily_profit = round(revenue - daily_total_cost, 2)
-        daily_reward = daily_profit  # Reward signal for future RL policy
+        daily_reward = daily_profit
 
-        # -------------------------------------------------------------
-        # STEP 5: NUMERICAL OBSERVATION VECTOR
-        # -------------------------------------------------------------
         pending_qty_sum = sum(p["quantity"] for p in pending_orders)
         min_days_until_del = (
             min(p["days_remaining"] for p in pending_orders) if pending_orders else 0
@@ -219,9 +216,6 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
             float(reorder_point),
         ]
 
-        # -------------------------------------------------------------
-        # STEP 6: ACCUMULATE METRICS & RECORD DAILY RESULT
-        # -------------------------------------------------------------
         total_demand += daily_demand
         total_fulfilled_demand += fulfilled_demand
         total_stockout_units += stockout_quantity
@@ -253,7 +247,6 @@ def run_simulation(db: Session, request: SimulationRequest) -> SimulationRespons
             )
         )
 
-    # 8. Compute Overall Simulation Summary
     service_level = (
         round((total_fulfilled_demand / total_demand) * 100.0, 2)
         if total_demand > 0

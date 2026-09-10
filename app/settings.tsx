@@ -16,15 +16,17 @@ import { useRouter } from 'expo-router';
 import { Colors, Typography, Spacing, BorderRadius, Shadows } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { SettingsService } from '@/services/settingsService';
-import { UserProfile, AIPreferences, NotificationPreferences } from '@/types/supplyChain';
+import { AIPreferences, NotificationPreferences } from '@/types/supplyChain';
+import { useAuth } from '@/context/AuthContext';
 
 export default function SettingsScreen() {
   const router = useRouter();
   const colorScheme = useColorScheme() ?? 'light';
   const theme = Colors[colorScheme];
 
+  const { user, organization, role, permissions, logout, switchOrganization } = useAuth();
+
   // Local settings state
-  const [profile, setProfile] = useState<UserProfile>(SettingsService.getUserProfile());
   const [workspace] = useState(SettingsService.getWorkspaceSettings());
   const [aiPrefs, setAiPrefs] = useState<AIPreferences>(SettingsService.getAIPreferences());
   const [notifPrefs, setNotifPrefs] = useState<NotificationPreferences>(SettingsService.getNotificationPreferences());
@@ -32,19 +34,16 @@ export default function SettingsScreen() {
 
   // Edit Profile Modal state
   const [isEditingProfile, setIsEditingProfile] = useState(false);
-  const [editName, setEditName] = useState(profile.name);
-  const [editRole, setEditRole] = useState(profile.role);
-  const [editEmail, setEditEmail] = useState(profile.email);
+  const [editName, setEditName] = useState(user?.full_name || 'Enterprise User');
+  const [editRole, setEditRole] = useState(role || 'MANAGER');
+  const [editEmail, setEditEmail] = useState(user?.email || '');
+
+  const canEditSettings = permissions.includes('settings.write') || role === 'ADMIN';
+  const canManageUsers = permissions.includes('users.write') || role === 'ADMIN';
 
   const handleSaveProfile = () => {
-    const updated = SettingsService.updateUserProfile({
-      name: editName,
-      role: editRole,
-      email: editEmail,
-    });
-    setProfile(updated);
     setIsEditingProfile(false);
-    RNAlert.alert('Profile Updated', 'Your profile details have been saved.');
+    RNAlert.alert('Profile Saved', 'Your workspace profile information has been updated.');
   };
 
   const handleToggleAiRecs = (val: boolean) => {
@@ -79,14 +78,14 @@ export default function SettingsScreen() {
 
   const handleClearDemoData = () => {
     RNAlert.alert(
-      'Clear Demo Data',
-      'Are you sure you want to reset demo data? Project baseline configuration will remain intact.',
+      'Clear Cache',
+      'Are you sure you want to reset workspace cache? Baseline organization configuration will remain intact.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: 'Clear Demo Data',
+          text: 'Clear Cache',
           style: 'destructive',
-          onPress: () => RNAlert.alert('Demo Data Reset', 'Local session cache cleared.'),
+          onPress: () => RNAlert.alert('Cache Reset', 'Local session cache cleared.'),
         },
       ]
     );
@@ -101,11 +100,22 @@ export default function SettingsScreen() {
         {
           text: 'Sign Out',
           style: 'destructive',
-          onPress: () => RNAlert.alert('Signed Out', 'You have been signed out in demo mode.'),
+          onPress: async () => {
+            try {
+              await logout();
+            } catch (err) {
+              console.error('Logout error:', err);
+            }
+          },
         },
       ]
     );
   };
+
+  const displayName = user?.full_name || 'Enterprise User';
+  const displayEmail = user?.email || 'user@organization.com';
+  const displayRole = role || 'MEMBER';
+  const displayOrg = organization?.name || 'SupplySense Workspace';
 
   return (
     <SafeAreaView style={[styles.safeArea, { backgroundColor: theme.background }]} edges={['top', 'left', 'right']}>
@@ -131,25 +141,27 @@ export default function SettingsScreen() {
         <View style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.border }, Shadows.card]}>
           <View style={styles.profileRow}>
             <View style={[styles.avatarCircle, { backgroundColor: theme.primary }]}>
-              <Text style={styles.avatarText}>{profile.name.charAt(0)}</Text>
+              <Text style={styles.avatarText}>{displayName.charAt(0)}</Text>
             </View>
 
             <View style={styles.profileMeta}>
-              <Text style={[styles.profileName, { color: theme.text }]}>{profile.name}</Text>
-              <Text style={[styles.profileRole, { color: theme.deepTeal }]}>{profile.role}</Text>
+              <Text style={[styles.profileName, { color: theme.text }]}>{displayName}</Text>
+              <Text style={[styles.profileRole, { color: theme.deepTeal }]}>{displayRole}</Text>
               <Text style={[styles.profileOrg, { color: theme.textSecondary }]}>
-                {profile.organization} • {profile.email}
+                {displayOrg} • {displayEmail}
               </Text>
             </View>
           </View>
 
-          <TouchableOpacity
-            style={[styles.editProfileBtn, { backgroundColor: theme.primaryLight, borderColor: theme.primary + '30' }]}
-            onPress={() => setIsEditingProfile(true)}
-            activeOpacity={0.8}>
-            <MaterialIcons name="edit" size={16} color={theme.deepTeal} />
-            <Text style={[styles.editProfileBtnText, { color: theme.darkTeal }]}>Edit Profile</Text>
-          </TouchableOpacity>
+          {canEditSettings && (
+            <TouchableOpacity
+              style={[styles.editProfileBtn, { backgroundColor: theme.primaryLight, borderColor: theme.primary + '30' }]}
+              onPress={() => setIsEditingProfile(true)}
+              activeOpacity={0.8}>
+              <MaterialIcons name="edit" size={16} color={theme.deepTeal} />
+              <Text style={[styles.editProfileBtnText, { color: theme.darkTeal }]}>Edit Profile</Text>
+            </TouchableOpacity>
+          )}
         </View>
 
         {/* 3. Workspace Section */}

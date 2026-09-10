@@ -27,6 +27,8 @@ class SupplyChainEnv(gym.Env):
         max_steps: int = 30,
         fixed_order_quantity: int = 50,
         supplier_id: Optional[int] = None,
+        preloaded_entities: Optional[Dict[str, Any]] = None,
+        organization_id: Optional[str] = None,
     ):
         super().__init__()
 
@@ -36,6 +38,8 @@ class SupplyChainEnv(gym.Env):
         self.max_steps = max_steps
         self.fixed_order_quantity = fixed_order_quantity
         self.supplier_id = supplier_id
+        self.preloaded_entities = preloaded_entities
+        self.organization_id = str(organization_id) if organization_id else None
 
         # Action Space: 0 = NOOP, 1 = ORDER, 2 = EXPEDITE
         self.action_space = spaces.Discrete(3)
@@ -74,34 +78,62 @@ class SupplyChainEnv(gym.Env):
 
     def _load_domain_entities(self):
         """Load and cache Product, Supplier, Inventory thresholds, and Forecast items."""
-        # 1. Fetch Product
-        self.product = self.db.query(Product).filter(Product.id == self.product_id).first()
-        if not self.product:
-            raise ValueError(f"Product with ID {self.product_id} not found in database")
+        if self.preloaded_entities:
+            self.product = self.preloaded_entities.get("product")
+            self.supplier = self.preloaded_entities.get("supplier")
+            self.safety_stock = self.preloaded_entities.get("safety_stock", 10)
+            self.reorder_point = self.preloaded_entities.get("reorder_point", 20)
+            self.forecast_items = self.preloaded_entities.get("forecast_items", [])
 
-        # 2. Fetch Supplier
-        if self.supplier_id:
-            self.supplier = self.db.query(Supplier).filter(Supplier.id == self.supplier_id).first()
-        else:
-            linked = (
-                self.db.query(Supplier)
-                .join(Order, Supplier.id == Order.supplier_id)
-                .filter(Order.product_id == self.product_id)
-                .first()
-            )
-            self.supplier = linked if linked else self.db.query(Supplier).first()
+        if not self.product:
+            # 1. Fetch Product
+            prod_query = self.db.query(Product).filter(Product.id == self.product_id)
+            if self.organization_id:
+                prod_query = prod_query.filter(Product.organization_id == self.organization_id)
+            self.product = prod_query.first()
+            if not self.product:
+                raise ValueError(
+                    f"Product with ID {self.product_id} not found in database for current organization"
+                )
 
         if not self.supplier:
-            raise ValueError("No active supplier found in database for environment")
+            # 2. Fetch Supplier
+            if self.supplier_id:
+                sup_query = self.db.query(Supplier).filter(Supplier.id == self.supplier_id)
+                if self.organization_id:
+                    sup_query = sup_query.filter(Supplier.organization_id == self.organization_id)
+                self.supplier = sup_query.first()
+            else:
+                linked_query = (
+                    self.db.query(Supplier)
+                    .join(Order, Supplier.id == Order.supplier_id)
+                    .filter(Order.product_id == self.product_id)
+                )
+                if self.organization_id:
+                    linked_query = linked_query.filter(
+                        Supplier.organization_id == self.organization_id,
+                        Order.organization_id == self.organization_id,
+                    )
+                linked = linked_query.first()
+                if linked:
+                    self.supplier = linked
+                else:
+                    fallback_query = self.db.query(Supplier)
+                    if self.organization_id:
+                        fallback_query = fallback_query.filter(Supplier.organization_id == self.organization_id)
+                    self.supplier = fallback_query.first()
 
-        # 3. Fetch Inventory Record thresholds
-        inv_rec = (
-            self.db.query(InventoryRecord)
-            .filter(InventoryRecord.product_id == self.product_id)
-            .first()
-        )
-        self.safety_stock = inv_rec.safety_stock if inv_rec else 10
-        self.reorder_point = inv_rec.reorder_point if inv_rec else 20
+            if not self.supplier:
+                raise ValueError("No active supplier found in database for environment")
+
+        if not self.preloaded_entities or "safety_stock" not in self.preloaded_entities:
+            # 3. Fetch Inventory Record thresholds
+            inv_query = self.db.query(InventoryRecord).filter(InventoryRecord.product_id == self.product_id)
+            if self.organization_id:
+                inv_query = inv_query.filter(InventoryRecord.organization_id == self.organization_id)
+            inv_rec = inv_query.first()
+            self.safety_stock = inv_rec.safety_stock if inv_rec else 10
+            self.reorder_point = inv_rec.reorder_point if inv_rec else 20
 
         # 4. Configurable Cost Model Parameters
         self.unit_selling_price = float(self.product.unit_price)
@@ -109,11 +141,15 @@ class SupplyChainEnv(gym.Env):
         self.holding_cost_per_unit_day = round(self.unit_selling_price * 0.02, 2)
         self.shortage_cost_per_unit = round(self.unit_selling_price * 1.5, 2)
 
-        # 5. Fetch Forecast items for the entire episode horizon (max_steps + 1 for lookahead)
-        forecast_data = generate_forecast(
-            db=self.db, product_id=self.product_id, days=self.max_steps + 1
-        )
-        self.forecast_items = forecast_data["forecast"]
+        # 5. Fetch Forecast items if not preloaded
+        if not self.forecast_items:
+            forecast_data = generate_forecast(
+                db=self.db,
+                product_id=self.product_id,
+                days=self.max_steps + 1,
+                organization_id=self.organization_id,
+            )
+            self.forecast_items = forecast_data["forecast"]
 
     def _build_observation(self, starting_inventory: int, step_idx: int) -> np.ndarray:
         """Construct the 9-element float32 observation vector for a given step_idx."""

@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from database.db import get_db
 from schemas.forecast import ForecastEvaluationResponse, ForecastResponse
 from services.forecasting_service import evaluate_forecast, generate_forecast
+from utils.security import require_permission
 
 router = APIRouter(prefix="/api/forecast", tags=["forecast"])
 
@@ -13,9 +14,13 @@ def get_product_forecast(
     product_id: int,
     days: int = Query(7, ge=1, le=365, description="Number of future days to forecast"),
     db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("analytics.read")),
 ):
-    """Generate a demand forecast for a specified product using Prophet."""
-    result = generate_forecast(db=db, product_id=product_id, days=days)
+    """Generate a demand forecast for a specified product using Prophet within the active organization."""
+    _, current_org = auth_data
+    result = generate_forecast(
+        db=db, product_id=product_id, days=days, organization_id=str(current_org.id)
+    )
     return result
 
 
@@ -26,7 +31,11 @@ def get_forecast_evaluation(
         30, ge=7, le=90, description="Holdout evaluation period in days"
     ),
     db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("analytics.read")),
 ):
-    """Evaluate Prophet forecast performance using time-based holdout and compute MAE."""
-    result = evaluate_forecast(db=db, product_id=product_id, holdout_days=holdout_days)
+    """Evaluate Prophet forecast performance using time-based holdout and compute MAE within the active organization."""
+    _, current_org = auth_data
+    result = evaluate_forecast(
+        db=db, product_id=product_id, holdout_days=holdout_days, organization_id=str(current_org.id)
+    )
     return result

@@ -9,14 +9,11 @@ from schemas.demand_history import (
     DemandHistoryResponse,
     DemandHistoryUpdate,
 )
+from services.forecasting_service import invalidate_forecast_cache
+from utils.helpers import dump_model
+from utils.security import get_current_tenant, require_permission
 
 router = APIRouter(prefix="/api/demand-history", tags=["demand-history"])
-
-
-def _dump(model, **kwargs):
-    if hasattr(model, "model_dump"):
-        return model.model_dump(**kwargs)
-    return model.dict(**kwargs)
 
 
 @router.get("", response_model=List[DemandHistoryResponse])
@@ -25,20 +22,30 @@ def get_demand_history(
     skip: int = 0,
     limit: int = 10000,
     db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("products.read")),
 ):
-    """Retrieve historical demand records with optional filtering by product_id."""
-    query = db.query(DemandHistory)
+    """Retrieve historical demand records for the active organization with optional product filtering."""
+    _, current_org = auth_data
+    query = db.query(DemandHistory).filter(DemandHistory.organization_id == current_org.id)
     if product_id is not None:
         query = query.filter(DemandHistory.product_id == product_id)
     return query.order_by(DemandHistory.date.asc()).offset(skip).limit(limit).all()
 
 
 @router.get("/{record_id}", response_model=DemandHistoryResponse)
-def get_demand_history_record(record_id: int, db: Session = Depends(get_db)):
-    """Retrieve a single demand history record by ID."""
+def get_demand_history_record(
+    record_id: int,
+    db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("products.read")),
+):
+    """Retrieve a single demand history record by ID within the active organization."""
+    _, current_org = auth_data
     record = (
         db.query(DemandHistory)
-        .filter(DemandHistory.id == record_id)
+        .filter(
+            DemandHistory.id == record_id,
+            DemandHistory.organization_id == current_org.id,
+        )
         .first()
     )
     if not record:
@@ -51,20 +58,32 @@ def get_demand_history_record(record_id: int, db: Session = Depends(get_db)):
 
 @router.post("", response_model=DemandHistoryResponse, status_code=status.HTTP_201_CREATED)
 def create_demand_history_record(
-    record: DemandHistoryCreate, db: Session = Depends(get_db)
+    record: DemandHistoryCreate,
+    db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("inventory.write")),
 ):
-    """Create a new demand history record for a product."""
-    product = db.query(Product).filter(Product.id == record.product_id).first()
+    """Create a new demand history record for a product within the active organization."""
+    _, current_org = auth_data
+
+    # Verify referenced product belongs to current organization
+    product = (
+        db.query(Product)
+        .filter(Product.id == record.product_id, Product.organization_id == current_org.id)
+        .first()
+    )
     if not product:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Product with ID {record.product_id} does not exist",
+            detail=f"Product with ID {record.product_id} does not exist in your organization",
         )
 
-    db_record = DemandHistory(**_dump(record))
+    record_dict = dump_model(record)
+    record_dict["organization_id"] = current_org.id
+    db_record = DemandHistory(**record_dict)
     db.add(db_record)
     db.commit()
     db.refresh(db_record)
+    invalidate_forecast_cache(record.product_id)
     return db_record
 
 
@@ -73,11 +92,16 @@ def update_demand_history_record(
     record_id: int,
     record_update: DemandHistoryUpdate,
     db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("inventory.write")),
 ):
-    """Update an existing demand history record by ID."""
+    """Update an existing demand history record by ID within the active organization."""
+    _, current_org = auth_data
     db_record = (
         db.query(DemandHistory)
-        .filter(DemandHistory.id == record_id)
+        .filter(
+            DemandHistory.id == record_id,
+            DemandHistory.organization_id == current_org.id,
+        )
         .first()
     )
     if not db_record:
@@ -86,34 +110,49 @@ def update_demand_history_record(
             detail=f"DemandHistory record with ID {record_id} not found",
         )
 
-    update_data = _dump(record_update, exclude_unset=True)
+    update_data = dump_model(record_update, exclude_unset=True)
 
     if "product_id" in update_data:
         product = (
             db.query(Product)
-            .filter(Product.id == update_data["product_id"])
+            .filter(
+                Product.id == update_data["product_id"],
+                Product.organization_id == current_org.id,
+            )
             .first()
         )
         if not product:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Product with ID {update_data['product_id']} does not exist",
+                detail=f"Product with ID {update_data['product_id']} does not exist in your organization",
             )
 
+    old_product_id = db_record.product_id
     for field, value in update_data.items():
         setattr(db_record, field, value)
 
     db.commit()
     db.refresh(db_record)
+    invalidate_forecast_cache(old_product_id)
+    if db_record.product_id != old_product_id:
+        invalidate_forecast_cache(db_record.product_id)
     return db_record
 
 
 @router.delete("/{record_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_demand_history_record(record_id: int, db: Session = Depends(get_db)):
-    """Delete a demand history record by ID."""
+def delete_demand_history_record(
+    record_id: int,
+    db: Session = Depends(get_db),
+    auth_data=Depends(require_permission("inventory.write")),
+):
+    """Delete a demand history record by ID within the active organization."""
+    _, current_org = auth_data
     db_record = (
         db.query(DemandHistory)
-        .filter(DemandHistory.id == record_id)
+        .filter(
+            DemandHistory.id == record_id,
+            DemandHistory.organization_id == current_org.id,
+        )
         .first()
     )
     if not db_record:
@@ -122,6 +161,8 @@ def delete_demand_history_record(record_id: int, db: Session = Depends(get_db)):
             detail=f"DemandHistory record with ID {record_id} not found",
         )
 
+    product_id = db_record.product_id
     db.delete(db_record)
     db.commit()
+    invalidate_forecast_cache(product_id)
     return None

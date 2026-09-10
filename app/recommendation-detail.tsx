@@ -14,12 +14,15 @@ import { Colors, Typography, Spacing, BorderRadius, Shadows } from '@/constants/
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { RecommendationService } from '@/services/recommendationService';
 import { StatusBadge } from '@/components/ui/StatusBadge';
+import { useAuth } from '@/context/AuthContext';
 
 export default function RecommendationDetailScreen() {
   const router = useRouter();
   const params = useLocalSearchParams<{ id?: string }>();
   const colorScheme = useColorScheme() ?? 'light';
   const theme = Colors[colorScheme];
+  const { permissions } = useAuth();
+  const canApprove = permissions.includes('recommendations.approve');
 
   const rec = (params.id ? RecommendationService.getRecommendationById(params.id) : undefined) || RecommendationService.getRecommendations()[0];
   const [decisionState, setDecisionState] = useState<'PENDING' | 'APPROVED' | 'MODIFIED' | 'REJECTED'>(rec?.decisionState || 'PENDING');
